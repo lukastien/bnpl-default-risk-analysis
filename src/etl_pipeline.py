@@ -2,23 +2,52 @@
 etl_pipeline.py
 ================
 Loads the raw "Give Me Some Credit" dataset, cleans it, engineers
-BNPL-relevant features, and writes it into a local SQLite database
-(see sql/schema.sql).
+BNPL-relevant features, and writes processed output to CSV
+(SQLite load still TBD — see sql/schema.sql).
 
-STATUS: placeholder stub — load step implemented; cleaning / features TBD.
-
-Usage (once fully implemented):
+Usage:
     python src/etl_pipeline.py
 """
 
+from __future__ import annotations
+
 import pandas as pd
-import sqlite3
 from pathlib import Path
 
 RAW_TRAIN_PATH = Path("data/raw/cs-training.csv")
 RAW_TEST_PATH = Path("data/raw/cs-test.csv")
 PROCESSED_DATA_PATH = Path("data/processed/credit_data_clean.csv")
 DB_PATH = Path("data/processed/credit_risk.db")
+
+# 99th-percentile caps for continuous outliers (computed on the combined frame).
+OUTLIER_CAP_QUANTILE = 0.99
+
+# GMSC data-entry codes that are not real late-payment counts.
+LATE_COUNT_ARTIFACT_CODES = {96, 98}
+
+COLUMN_RENAME = {
+    "Id": "id",
+    "index": "id",
+    "Unnamed: 0": "id",
+    "SeriousDlqin2yrs": "serious_dlq_2yrs",
+    "RevolvingUtilizationOfUnsecuredLines": "revolving_utilization",
+    "age": "age",
+    "NumberOfTime30-59DaysPastDueNotWorse": "times_30_59_days_late",
+    "DebtRatio": "debt_ratio",
+    "MonthlyIncome": "monthly_income",
+    "NumberOfOpenCreditLinesAndLoans": "num_open_credit_lines",
+    "NumberOfTimes90DaysLate": "times_90_days_late",
+    "NumberRealEstateLoansOrLines": "num_real_estate_loans",
+    "NumberOfTime60-89DaysPastDueNotWorse": "times_60_89_days_late",
+    "NumberOfDependents": "num_dependents",
+    "source_flag": "source_flag",
+}
+
+LATE_COUNT_COLS = [
+    "times_30_59_days_late",
+    "times_60_89_days_late",
+    "times_90_days_late",
+]
 
 
 def load_raw_data(
@@ -39,31 +68,191 @@ def load_raw_data(
     return train_df, test_df
 
 
+def combine_train_test(train_df: pd.DataFrame, test_df: pd.DataFrame) -> pd.DataFrame:
+    """Concatenate train + test with a source_flag so we can always split back out."""
+    train = train_df.reset_index().copy()
+    test = test_df.reset_index().copy()
+    # Source files use an unnamed leading id column; normalize before snake_case rename.
+    for frame in (train, test):
+        if frame.columns[0] in ("index", "Unnamed: 0", "Id"):
+            frame.rename(columns={frame.columns[0]: "Id"}, inplace=True)
+    train["source_flag"] = "train"
+    test["source_flag"] = "test"
+    return pd.concat([train, test], ignore_index=True)
+
+
+def _age_bucket(age: pd.Series) -> pd.Series:
+    """Coarse age buckets used as an income proxy for stratified median imputation."""
+    return pd.cut(
+        age,
+        bins=[-float("inf"), 30, 45, 60, float("inf")],
+        labels=["under_30", "30_44", "45_59", "60_plus"],
+        right=False,
+    )
+
+
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Clean and standardize the raw dataset.
+    Clean and standardize the combined train+test dataset.
 
-    TODO:
-      - Rename columns to snake_case matching sql/schema.sql
-      - Handle missing MonthlyIncome (has real NaNs in source data —
-        consider median imputation by age/dependents group)
-      - Handle missing NumberOfDependents
-      - Filter or cap extreme outliers in DebtRatio and age (source data
-        has some known bad values, e.g. age = 0)
+    Steps: snake_case rename → age==0 fix → income/dependents imputation →
+    DebtRatio / utilization capping → GMSC 96/98 late-count artifact handling.
     """
-    raise NotImplementedError("Fill in cleaning logic")
+    out = df.copy()
+
+    # --- 1. Snake_case column names (aligned with sql/schema.sql) ---
+    out = out.rename(columns=COLUMN_RENAME)
+    # Defensive: any leftover CamelCase / hyphenated names
+    out.columns = [
+        c if c in COLUMN_RENAME.values() else c.lower().replace("-", "_")
+        for c in out.columns
+    ]
+
+    # --- 4. Fix age == 0 before age-bucketed income imputation ---
+    # (Listed as step 4 in the prompt; applied early so stratified income medians
+    # are not polluted by invalid ages.)
+    age_zero_mask = out["age"] == 0
+    n_age_zero = int(age_zero_mask.sum())
+    if n_age_zero:
+        median_age = float(out.loc[~age_zero_mask, "age"].median())
+        out.loc[age_zero_mask, "age"] = median_age
+    print(f"[clean] age == 0 treated as missing and imputed with median age: {n_age_zero:,} rows")
+
+    # --- 2. Impute MonthlyIncome (~20% missing) by age-bucket median ---
+    income_missing = out["monthly_income"].isna()
+    n_income_imputed = int(income_missing.sum())
+    out["_age_bucket"] = _age_bucket(out["age"]).astype(str)
+    bucket_medians = (
+        out.loc[~income_missing]
+        .groupby("_age_bucket", observed=True)["monthly_income"]
+        .median()
+        .to_dict()
+    )
+    global_income_median = float(out.loc[~income_missing, "monthly_income"].median())
+    imputed_income = out.loc[income_missing, "_age_bucket"].map(bucket_medians)
+    out.loc[income_missing, "monthly_income"] = (
+        imputed_income.fillna(global_income_median).astype(float)
+    )
+    out = out.drop(columns=["_age_bucket"])
+    print(
+        f"[clean] monthly_income imputed (age-bucket median, "
+        f"fallback global median={global_income_median:,.0f}): {n_income_imputed:,} values"
+    )
+
+    # --- 3. Impute NumberOfDependents with mode (typically 0) ---
+    dep_missing = out["num_dependents"].isna()
+    n_dep_imputed = int(dep_missing.sum())
+    dep_mode = float(out.loc[~dep_missing, "num_dependents"].mode().iloc[0])
+    out.loc[dep_missing, "num_dependents"] = dep_mode
+    print(f"[clean] num_dependents imputed with mode={dep_mode:g}: {n_dep_imputed:,} values")
+
+    # --- 5. Cap extreme DebtRatio and revolving utilization at 99th percentile ---
+    for col in ("debt_ratio", "revolving_utilization"):
+        cap = float(out[col].quantile(OUTLIER_CAP_QUANTILE))
+        before_max = float(out[col].max())
+        above = out[col] > cap
+        n_capped = int(above.sum())
+        out.loc[above, col] = cap
+        after_max = float(out[col].max())
+        print(
+            f"[clean] {col} capped at {OUTLIER_CAP_QUANTILE:.0%}ile "
+            f"({cap:.4f}): {n_capped:,} rows | max {before_max:.4f} → {after_max:.4f}"
+        )
+
+    # --- 6. GMSC late-count artifact (96 / 98 are data-entry codes, not real counts) ---
+    # Decision: flag affected rows, then replace 96/98 with the column median of
+    # non-artifact values so downstream sums (prior_delinquency_count) stay on a
+    # realistic scale instead of treating 96/98 as literal delinquency counts.
+    artifact_mask = pd.Series(False, index=out.index)
+    for col in LATE_COUNT_COLS:
+        col_artifact = out[col].isin(LATE_COUNT_ARTIFACT_CODES)
+        artifact_mask |= col_artifact
+        valid_median = float(out.loc[~col_artifact, col].median())
+        out.loc[col_artifact, col] = valid_median
+    out["late_payment_code_artifact"] = artifact_mask.astype(int)
+    n_artifact = int(artifact_mask.sum())
+    print(
+        f"[clean] late-count 96/98 artifact flagged + replaced with non-artifact median: "
+        f"{n_artifact:,} rows"
+    )
+
+    return out
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Engineer BNPL-relevant features.
-
-    TODO:
-      - payment_to_income_ratio (approximate from DebtRatio * MonthlyIncome)
-      - prior_delinquency_count = sum of the three "times late" columns
-      - revolving_utilization_bucket (low/medium/high)
+    Engineer BNPL-relevant features on the cleaned combined dataset.
     """
-    raise NotImplementedError("Fill in feature engineering logic")
+    out = df.copy()
+
+    # --- 1. payment_to_income_ratio (resume-named payment-burden feature) ---
+    # Exact formula:
+    #   estimated_monthly_debt_payment = debt_ratio * monthly_income
+    #   payment_to_income_ratio = estimated_monthly_debt_payment / monthly_income
+    #                             (NaN when monthly_income == 0)
+    #
+    # In Give Me Some Credit, DebtRatio is already defined as monthly debt payments
+    # divided by monthly income when income is reported — so for monthly_income > 0
+    # this equals debt_ratio algebraically. We still materialize it as an explicit
+    # named feature (payment-to-income ratio) for interpretability and the resume claim,
+    # with a safe divide for any remaining zero-income rows.
+    estimated_monthly_debt_payment = out["debt_ratio"] * out["monthly_income"]
+    out["payment_to_income_ratio"] = estimated_monthly_debt_payment / out["monthly_income"].replace(
+        0, pd.NA
+    )
+    out["payment_to_income_ratio"] = pd.to_numeric(out["payment_to_income_ratio"], errors="coerce")
+
+    # --- 2. prior_delinquency_count (post artifact-handling late counts) ---
+    out["prior_delinquency_count"] = (
+        out["times_30_59_days_late"]
+        + out["times_60_89_days_late"]
+        + out["times_90_days_late"]
+    )
+
+    # --- 3. revolving_utilization_bucket ---
+    out["revolving_utilization_bucket"] = pd.cut(
+        out["revolving_utilization"],
+        bins=[-float("inf"), 0.30, 0.70, float("inf")],
+        labels=["Low (<30%)", "Medium (30-70%)", "High (>70%)"],
+        right=False,
+    )
+
+    _print_feature_summaries(out)
+    return out
+
+
+def _print_feature_summaries(df: pd.DataFrame) -> None:
+    """Print mean/median/distribution for engineered features by source_flag."""
+    print("\n=== Engineered feature summary (by source_flag) ===")
+    for source in ("train", "test"):
+        subset = df.loc[df["source_flag"] == source]
+        print(f"\n--- {source} (n={len(subset):,}) ---")
+
+        pti = subset["payment_to_income_ratio"]
+        print(
+            f"payment_to_income_ratio: mean={pti.mean():.4f}  "
+            f"median={pti.median():.4f}  "
+            f"p25={pti.quantile(0.25):.4f}  p75={pti.quantile(0.75):.4f}  "
+            f"nulls={pti.isna().sum()}"
+        )
+
+        pdc = subset["prior_delinquency_count"]
+        print(
+            f"prior_delinquency_count: mean={pdc.mean():.4f}  "
+            f"median={pdc.median():.4f}  "
+            f"min={pdc.min():.0f}  max={pdc.max():.0f}"
+        )
+        print("  value distribution (top counts):")
+        vc = pdc.value_counts().sort_index().head(10)
+        for val, cnt in vc.items():
+            print(f"  {val:g}: {cnt:,}")
+
+        bucket = subset["revolving_utilization_bucket"]
+        print("revolving_utilization_bucket distribution:")
+        dist = bucket.value_counts(dropna=False).sort_index()
+        pct = bucket.value_counts(normalize=True, dropna=False).sort_index()
+        for label in dist.index:
+            print(f"  {label}: {dist[label]:,} ({100 * pct[label]:.1f}%)")
 
 
 def load_to_sqlite(df: pd.DataFrame, db_path: Path):
@@ -82,11 +271,20 @@ def main():
     print(f"Combined total: {n_combined:,} rows")
     print(f"200K+ confirmed: {n_combined >= 200_000}")
 
-    # df_clean = clean_data(...)
-    # df_features = engineer_features(df_clean)
-    # df_features.to_csv(PROCESSED_DATA_PATH, index=False)
-    # load_to_sqlite(df_features, DB_PATH)
-    print("TODO: implement clean_data(), engineer_features(), and load_to_sqlite()")
+    combined = combine_train_test(train_df, test_df)
+    print(f"\nCombined frame with source_flag: {len(combined):,} rows")
+
+    df_clean = clean_data(combined)
+    df_features = engineer_features(df_clean)
+
+    PROCESSED_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df_features.to_csv(PROCESSED_DATA_PATH, index=False)
+    print(
+        f"\nWrote {PROCESSED_DATA_PATH} — "
+        f"shape {df_features.shape[0]:,} rows × {df_features.shape[1]} columns"
+    )
+    print(f"Columns: {list(df_features.columns)}")
+    print("TODO: implement load_to_sqlite()")
 
 
 if __name__ == "__main__":
