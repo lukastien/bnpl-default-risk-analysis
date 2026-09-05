@@ -1,0 +1,13 @@
+risk_tier,stage,count,stage_type,notes
+Low,flagged,176052.0,observed_model_flag,Borrowers in tier / assumed contacted under 100% outreach policy.
+Low,contacted,176052.0,observed_model_flag,Borrowers in tier / assumed contacted under 100% outreach policy.
+Low,recovered,5866.7,model_projected,MODEL-PROJECTED (not observed): prevented defaults at success_rate=20% payment-plan assumption.
+Low,written_off,23466.7,model_projected,MODEL-PROJECTED (not observed): residual defaults after intervention at (1−success_rate)=80%.
+Medium,flagged,50300.0,observed_model_flag,Borrowers in tier / assumed contacted under 100% outreach policy.
+Medium,contacted,50300.0,observed_model_flag,Borrowers in tier / assumed contacted under 100% outreach policy.
+Medium,recovered,5667.6,model_projected,MODEL-PROJECTED (not observed): prevented defaults at success_rate=20% payment-plan assumption.
+Medium,written_off,22670.5,model_projected,MODEL-PROJECTED (not observed): residual defaults after intervention at (1−success_rate)=80%.
+High,flagged,25151.0,observed_model_flag,Borrowers in tier / assumed contacted under 100% outreach policy.
+High,contacted,25151.0,observed_model_flag,Borrowers in tier / assumed contacted under 100% outreach policy.
+High,recovered,4340.1,model_projected,MODEL-PROJECTED (not observed): prevented defaults at success_rate=20% payment-plan assumption.
+High,written_off,17360.3,model_projected,MODEL-PROJECTED (not observed): residual defaults after intervention at (1−success_rate)=80%.

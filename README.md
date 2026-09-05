@@ -40,7 +40,14 @@ In short: engineer and score on 200K+; learn and validate only on the labeled 15
 
 ### Survival analysis honesty
 
-The dataset has **no observed time-to-default** — only a binary 2-year serious-delinquency outcome. Survival duration in this project will be a **constructed** variable, not an observed one, built with a documented, deterministic rule (implemented in a later step). It must **never** be described as real observed time in any report, chart, dashboard, or interview talking point. Treat Kaplan–Meier / Cox results as an illustrative time-to-event extension on constructed durations, clearly labeled as such.
+The dataset has **no observed time-to-default** — only a binary 2-year serious-delinquency outcome. Survival duration in this project is a **constructed** variable, not an observed one. The deterministic rule (used by `src/export_for_tableau.py` for Kaplan–Meier curves) is:
+
+- Observation window = 24 months; non-events are right-censored at 24.
+- For events (`serious_dlq_2yrs = 1`):
+  `severity = prior_delinquency_count + 2 * utilization_bucket_ord` (Low/Med/High → 0/1/2),
+  `duration_months = clip(24 - 2 * severity, 1, 23)`.
+
+It must **never** be described as real observed time in any report, chart, dashboard, or interview talking point. Treat Kaplan–Meier / Cox results as an illustrative time-to-event extension on constructed durations, clearly labeled as such.
 
 ## Project Structure
 
@@ -62,7 +69,8 @@ bnpl-default-risk-analysis/
 │   ├── market_research_brief.md
 │   └── strategy_brief.md
 ├── dashboard/
-│   └── README.md                  # Link to published Tableau dashboard
+│   ├── data/                      # Tableau-ready CSVs (from src/export_for_tableau.py)
+│   └── README.md                  # Chart map + Tableau Public publish steps
 ├── requirements.txt
 └── README.md
 ```
@@ -73,7 +81,7 @@ bnpl-default-risk-analysis/
 2. **Classification Modeling** — logistic regression baseline + XGBoost trained/evaluated on labeled ~150K only; score the full ~251K to flag high-risk borrowers; evaluate with ROC-AUC and precision/recall given class imbalance (~6.7% positive rate)
 3. **Survival Analysis** — apply time-to-event modeling (`lifelines`, Kaplan-Meier / Cox Proportional Hazards) on a **constructed** (not observed) duration variable to estimate *when* high-risk borrowers are likely to default — see Data & Methodology Notes
 4. **Collections Cost Modeling** — Excel model comparing early-intervention cost vs. write-off cost by risk tier
-5. **Dashboard** — Tableau dashboard visualizing delinquency by risk tier and a collections funnel view
+5. **Dashboard** — Tableau Public charts fed by `dashboard/data/*.csv` (delinquency, collections funnel, survival)
 6. **Recommendation** — strategy brief proposing an intervention threshold by risk tier
 
 ## Tools
@@ -84,12 +92,12 @@ Python (pandas, scikit-learn, XGBoost, lifelines), SQL (SQLite), Excel, Tableau
 
 - [x] Repo structure + real dataset sourced (train + unlabeled test; 251,503 combined)
 - [x] Data & methodology notes (200K+ policy + survival caveat)
-- [ ] ETL pipeline (`src/etl_pipeline.py`) — load stub done; clean/features TBD
-- [ ] SQL schema + exploratory queries (`sql/schema.sql`)
-- [ ] EDA + classification modeling
-- [ ] Survival analysis (time-to-default)
+- [x] ETL pipeline (`src/etl_pipeline.py`)
+- [x] SQL schema + exploratory queries (`sql/schema.sql`)
+- [x] EDA + classification modeling
+- [x] Survival KM curves for Tableau (constructed duration — see methodology notes)
 - [ ] Collections cost-benefit Excel model
-- [ ] Tableau dashboard
+- [x] Tableau data exports (`dashboard/data/`) — publish URL TBD
 - [ ] Strategy brief write-up
 
 ---
