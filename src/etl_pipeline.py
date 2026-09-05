@@ -255,9 +255,164 @@ def _print_feature_summaries(df: pd.DataFrame) -> None:
             print(f"  {label}: {dist[label]:,} ({100 * pct[label]:.1f}%)")
 
 
-def load_to_sqlite(df: pd.DataFrame, db_path: Path):
-    """Write the cleaned DataFrame into the SQLite database defined in sql/schema.sql."""
-    raise NotImplementedError("Fill in database load logic")
+def load_to_sqlite(
+    df: pd.DataFrame,
+    db_path: Path = DB_PATH,
+    schema_path: Path = Path("sql/schema.sql"),
+) -> Path:
+    """
+    Create data/processed/credit_risk.db from sql/schema.sql and load the
+    cleaned combined DataFrame into borrowers.
+    """
+    import re
+    import sqlite3
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+
+    schema_sql = schema_path.read_text()
+    # Strip full-line and trailing inline SQL comments so ';' inside comments
+    # cannot split CREATE TABLE. Keep only DROP/CREATE for DDL execution.
+    cleaned_lines = []
+    for line in schema_sql.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("--"):
+            continue
+        if "--" in line:
+            line = line[: line.index("--")]
+        cleaned_lines.append(line)
+    no_comments = "\n".join(cleaned_lines)
+    ddl_statements = [
+        stmt.strip()
+        for stmt in no_comments.split(";")
+        if re.match(r"(?is)^(DROP|CREATE)\b", stmt.strip() or "")
+    ]
+    if len(ddl_statements) < 2:
+        raise RuntimeError(f"Expected DROP+CREATE in {schema_path}, got: {ddl_statements!r}")
+
+    conn = sqlite3.connect(db_path)
+    try:
+        for stmt in ddl_statements:
+            conn.execute(stmt)
+
+        load_df = df.copy()
+        # SQLite INTEGER NULL for unlabeled test rows (pandas NaN → None).
+        if "serious_dlq_2yrs" in load_df.columns:
+            load_df["serious_dlq_2yrs"] = load_df["serious_dlq_2yrs"].astype("Int64")
+
+        load_df.to_sql("borrowers", conn, if_exists="append", index=False)
+        conn.commit()
+
+        n_rows = conn.execute("SELECT COUNT(*) FROM borrowers").fetchone()[0]
+        n_train = conn.execute(
+            "SELECT COUNT(*) FROM borrowers WHERE source_flag = 'train'"
+        ).fetchone()[0]
+        n_test = conn.execute(
+            "SELECT COUNT(*) FROM borrowers WHERE source_flag = 'test'"
+        ).fetchone()[0]
+        n_test_null_label = conn.execute(
+            """
+            SELECT COUNT(*) FROM borrowers
+            WHERE source_flag = 'test' AND serious_dlq_2yrs IS NULL
+            """
+        ).fetchone()[0]
+        print(
+            f"[sqlite] Wrote {db_path} — {n_rows:,} rows "
+            f"(train={n_train:,}, test={n_test:,}, "
+            f"test labels NULL={n_test_null_label:,})"
+        )
+    finally:
+        conn.close()
+
+    return db_path
+
+
+def run_exploratory_queries(db_path: Path = DB_PATH) -> None:
+    """Run the five labeled-train exploratory queries and print results."""
+    import sqlite3
+
+    queries = {
+        "1. Overall default rate (train only)": """
+            SELECT
+                COUNT(*) AS borrower_count,
+                SUM(serious_dlq_2yrs) AS defaults,
+                ROUND(100.0 * SUM(serious_dlq_2yrs) / COUNT(*), 2) AS default_rate_pct
+            FROM borrowers
+            WHERE source_flag = 'train';
+        """,
+        "2. Default rate by revolving_utilization_bucket": """
+            SELECT
+                revolving_utilization_bucket,
+                COUNT(*) AS borrower_count,
+                ROUND(100.0 * SUM(serious_dlq_2yrs) / COUNT(*), 2) AS default_rate_pct
+            FROM borrowers
+            WHERE source_flag = 'train'
+            GROUP BY revolving_utilization_bucket
+            ORDER BY
+                CASE revolving_utilization_bucket
+                    WHEN 'Low (<30%)' THEN 1
+                    WHEN 'Medium (30-70%)' THEN 2
+                    WHEN 'High (>70%)' THEN 3
+                    ELSE 4
+                END;
+        """,
+        "3. Default rate by prior_delinquency_count bucket": """
+            SELECT
+                CASE
+                    WHEN prior_delinquency_count = 0 THEN '0'
+                    WHEN prior_delinquency_count BETWEEN 1 AND 2 THEN '1-2'
+                    WHEN prior_delinquency_count BETWEEN 3 AND 5 THEN '3-5'
+                    ELSE '6+'
+                END AS prior_delinquency_bucket,
+                COUNT(*) AS borrower_count,
+                ROUND(100.0 * SUM(serious_dlq_2yrs) / COUNT(*), 2) AS default_rate_pct
+            FROM borrowers
+            WHERE source_flag = 'train'
+            GROUP BY prior_delinquency_bucket
+            ORDER BY
+                CASE
+                    WHEN prior_delinquency_bucket = '0' THEN 1
+                    WHEN prior_delinquency_bucket = '1-2' THEN 2
+                    WHEN prior_delinquency_bucket = '3-5' THEN 3
+                    ELSE 4
+                END;
+        """,
+        "4. Default rate by age decade": """
+            SELECT
+                CAST(age / 10 * 10 AS INTEGER) AS age_decade_start,
+                COUNT(*) AS borrower_count,
+                ROUND(100.0 * SUM(serious_dlq_2yrs) / COUNT(*), 2) AS default_rate_pct
+            FROM borrowers
+            WHERE source_flag = 'train'
+            GROUP BY age_decade_start
+            ORDER BY age_decade_start;
+        """,
+        "5. Avg payment_to_income_ratio by default status": """
+            SELECT
+                serious_dlq_2yrs,
+                COUNT(*) AS borrower_count,
+                ROUND(AVG(payment_to_income_ratio), 4) AS avg_payment_to_income_ratio
+            FROM borrowers
+            WHERE source_flag = 'train'
+            GROUP BY serious_dlq_2yrs;
+        """,
+    }
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        print("\n=== Exploratory SQL results (train-labeled only) ===")
+        for title, sql in queries.items():
+            print(f"\n{title}")
+            cur = conn.execute(sql)
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+            print("  " + " | ".join(cols))
+            for row in rows:
+                print("  " + " | ".join(str(row[c]) for c in cols))
+    finally:
+        conn.close()
 
 
 def main():
@@ -271,20 +426,24 @@ def main():
     print(f"Combined total: {n_combined:,} rows")
     print(f"200K+ confirmed: {n_combined >= 200_000}")
 
-    combined = combine_train_test(train_df, test_df)
-    print(f"\nCombined frame with source_flag: {len(combined):,} rows")
+    # Prefer loading the already-written cleaned CSV when present (faster iteration).
+    if PROCESSED_DATA_PATH.exists():
+        print(f"\nLoading cleaned data from {PROCESSED_DATA_PATH}")
+        df_features = pd.read_csv(PROCESSED_DATA_PATH)
+    else:
+        combined = combine_train_test(train_df, test_df)
+        print(f"\nCombined frame with source_flag: {len(combined):,} rows")
+        df_clean = clean_data(combined)
+        df_features = engineer_features(df_clean)
+        PROCESSED_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        df_features.to_csv(PROCESSED_DATA_PATH, index=False)
+        print(
+            f"\nWrote {PROCESSED_DATA_PATH} — "
+            f"shape {df_features.shape[0]:,} rows × {df_features.shape[1]} columns"
+        )
 
-    df_clean = clean_data(combined)
-    df_features = engineer_features(df_clean)
-
-    PROCESSED_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df_features.to_csv(PROCESSED_DATA_PATH, index=False)
-    print(
-        f"\nWrote {PROCESSED_DATA_PATH} — "
-        f"shape {df_features.shape[0]:,} rows × {df_features.shape[1]} columns"
-    )
-    print(f"Columns: {list(df_features.columns)}")
-    print("TODO: implement load_to_sqlite()")
+    load_to_sqlite(df_features, DB_PATH)
+    run_exploratory_queries(DB_PATH)
 
 
 if __name__ == "__main__":
