@@ -4,3 +4,4 @@ __pycache__/
 data/processed/*.db
 .DS_Store
 .env
+.local/
