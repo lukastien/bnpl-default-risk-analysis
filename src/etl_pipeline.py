@@ -5,9 +5,9 @@ Loads the raw "Give Me Some Credit" dataset, cleans it, engineers
 BNPL-relevant features, and writes it into a local SQLite database
 (see sql/schema.sql).
 
-STATUS: placeholder stub — logic to be filled in.
+STATUS: placeholder stub — load step implemented; cleaning / features TBD.
 
-Usage (once implemented):
+Usage (once fully implemented):
     python src/etl_pipeline.py
 """
 
@@ -15,15 +15,28 @@ import pandas as pd
 import sqlite3
 from pathlib import Path
 
-RAW_DATA_PATH = Path("data/raw/credit_data.csv")
+RAW_TRAIN_PATH = Path("data/raw/cs-training.csv")
+RAW_TEST_PATH = Path("data/raw/cs-test.csv")
 PROCESSED_DATA_PATH = Path("data/processed/credit_data_clean.csv")
 DB_PATH = Path("data/processed/credit_risk.db")
 
 
-def load_raw_data(path: Path) -> pd.DataFrame:
-    """Load the raw CSV export into a DataFrame."""
-    df = pd.read_csv(path, index_col=0)  # first column is an unnamed row index in source file
-    return df
+def load_raw_data(
+    train_path: Path = RAW_TRAIN_PATH,
+    test_path: Path = RAW_TEST_PATH,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load the labeled training set and unlabeled Kaggle test set.
+
+    Returns
+    -------
+    train_df, test_df
+        Separate DataFrames. Training has SeriousDlqin2yrs labels;
+        test has the same columns but an empty (NaN) target.
+    """
+    train_df = pd.read_csv(train_path, index_col=0)
+    test_df = pd.read_csv(test_path, index_col=0)
+    return train_df, test_df
 
 
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -59,10 +72,17 @@ def load_to_sqlite(df: pd.DataFrame, db_path: Path):
 
 
 def main():
-    df_raw = load_raw_data(RAW_DATA_PATH)
-    print(f"Loaded {len(df_raw)} rows from {RAW_DATA_PATH}")
+    train_df, test_df = load_raw_data()
+    n_train = len(train_df)
+    n_test = len(test_df)
+    n_combined = n_train + n_test
 
-    # df_clean = clean_data(df_raw)
+    print(f"Training set ({RAW_TRAIN_PATH}): {n_train:,} rows (labeled)")
+    print(f"Test set     ({RAW_TEST_PATH}): {n_test:,} rows (unlabeled)")
+    print(f"Combined total: {n_combined:,} rows")
+    print(f"200K+ confirmed: {n_combined >= 200_000}")
+
+    # df_clean = clean_data(...)
     # df_features = engineer_features(df_clean)
     # df_features.to_csv(PROCESSED_DATA_PATH, index=False)
     # load_to_sqlite(df_features, DB_PATH)
